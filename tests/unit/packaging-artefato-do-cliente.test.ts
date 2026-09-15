@@ -121,6 +121,36 @@ describe("packaging — o artefato que o cliente instala", () => {
         `É o defeito do 'worker' voltando: build na VPS do cliente que nenhum update alcança.`,
     ).toEqual([]);
   });
+  it("o manifesto do Dokploy espelha as imagens de produção", () => {
+    // O Dokploy aponta para UM compose path, então o manifesto dele é uma
+    // segunda declaração independente de onde as imagens moram — a mesma
+    // família do default do compose que o caso "o default do compose diz o
+    // mesmo que o kit" vigia. Sem este caso, trocar a tag num arquivo e
+    // esquecer o outro congela metade da stack na versão velha.
+    const dokploy = fs.readFileSync(path.join(RAIZ, "docker-compose.dokploy.yml"), "utf8");
+    const noDokploy = lerServicos(dokploy);
+    expect([...noDokploy.keys()].sort()).toEqual(
+      ["app", "redis", "scheduler", "srh", "wacalls", "waha", "worker"].sort(),
+    );
+    for (const nome of NOSSOS) {
+      const blocoProd = servicos.get(nome)!;
+      const blocoDok = noDokploy.get(nome);
+      expect(blocoDok, `'${nome}' sumiu do manifesto do Dokploy`).toBeDefined();
+      const imgProd = blocoProd.match(/^\s{4}image:\s*(\S+)/m)?.[1];
+      const imgDok = blocoDok!.match(/^\s{4}image:\s*(\S+)/m)?.[1];
+      expect(imgDok, `'${nome}' sem image: no manifesto do Dokploy`).toBeDefined();
+      expect(
+        imgDok,
+        `'${nome}' diverge: prod '${imgProd}' vs dokploy '${imgDok}' — trocar a tag num ` +
+          `arquivo e esquecer o outro congela metade da stack na versão velha`,
+      ).toBe(imgProd);
+      expect(
+        /^\s{4}build:/m.test(blocoDok!),
+        `'${nome}' com build: no manifesto do Dokploy — o deploy deixaria de ser pull puro`,
+      ).toBe(false);
+    }
+  });
+
 
   it("toda imagem upstream está pinada — nunca :latest nem tag implícita", () => {
     const soltas: string[] = [];

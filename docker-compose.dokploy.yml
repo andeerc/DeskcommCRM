@@ -1,0 +1,226 @@
+# DeskcommCRM — deploy via Dokploy (Compose, um arquivo só).
+#
+# Por que este arquivo existe: o caminho padrão do repo usa DOIS composes
+# (docker-compose.prod.yml + override docker-compose.traefik.yml) e um Caddy
+# próprio. No Dokploy o Traefik e o HTTPS já são da plataforma, o Environment
+# da UI vira o `.env` ao lado do compose, e o deploy aponta para um único
+# compose path. Este arquivo junta prod + override num manifesto autocontido:
+# sem Caddy, sem bind de arquivo do repo, sem `ports:` TCP, app publicado só
+# pela rede `dokploy-network` via labels do Traefik.
+#
+# Uso (Dokploy): service Compose → source GitHub no seu fork → compose path
+# `./docker-compose.dokploy.yml` → colar o `.env` (ver `.env.dokploy.example`)
+# no Environment → deploy. O domínio sai das labels abaixo (HOST `DOMAIN`).
+#
+# O que FICOU DE FORA de propósito:
+# - Caddy (portas 80/443 são do Traefik do Dokploy; o 403 do webhook global
+#   do WAHA vive nas labels `deskcomm-waha-block` abaixo, como no override).
+# - `container_name:` (o Dokploy proíbe: quebra logs, métricas e recriação).
+# - bind `./Caddyfile` (re-clone do AutoDeploy esvazia mount de arquivo).
+# - bloco `build:` no worker/scheduler (a imagem `:stable` do GHCR é o caminho
+#   normal; quem quiser buildar usa o override docker-compose.build.yml fora
+#   do Dokploy).
+#
+# Ao atualizar o upstream, re-derivar deste mesmo par
+# (docker-compose.prod.yml + docker-compose.traefik.yml) e rodar
+# `docker compose -f docker-compose.dokploy.yml config` antes de commitar.
+# O gate tests/unit/portas-do-compose.test.ts cobre este arquivo.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"     # rotação: evita que o log encha o disco do VPS
+    max-file: "3"
+
+services:
+  app:
+    mem_limit: 768m
+    # `:stable` (última release), não `:latest` (topo da `main`).
+    image: ${APP_IMAGE:-ghcr.io/melgarafael/deskcommcrm:stable}
+    pull_policy: ${APP_PULL_POLICY:-always}
+    restart: unless-stopped
+    # O Environment do Dokploy é gravado como `.env` ao lado deste arquivo,
+    # então este `env_file` injeta todas as variáveis nos contêineres.
+    env_file: .env
+    depends_on:
+      srh:
+        condition: service_started
+      waha:
+        condition: service_started
+    healthcheck:
+      # Probe TCP puro (node existe na imagem; curl/nc não). NÃO usar
+      # /api/v1/health: ele dá 503 se WAHA/Redis caem, o que derrubaria o
+      # roteamento junto por uma dependência secundária.
+      test: ["CMD", "node", "-e", "require('net').connect(3000,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    logging: *default-logging
+    expose:
+      - "3000"
+    networks:
+      - internal
+      - proxy
+    labels:
+      traefik.enable: "true"
+      # Com o app nas duas redes, o Traefik precisa mirar o IP da rede do
+      # PROXY; apontando para a `internal` a requisição pendura até timeout
+      # (medido com Traefik v3.3 real no override original).
+      traefik.docker.network: "${TRAEFIK_NETWORK:-dokploy-network}"
+      # Rota principal — equivale ao `reverse_proxy app:3000` do Caddyfile.
+      traefik.http.routers.deskcomm.rule: "Host(`${DOMAIN}`)"
+      traefik.http.routers.deskcomm.entrypoints: "${TRAEFIK_ENTRYPOINT:-websecure}"
+      traefik.http.routers.deskcomm.tls.certresolver: "${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      traefik.http.routers.deskcomm.middlewares: "deskcomm-compress"
+      traefik.http.services.deskcomm.loadbalancer.server.port: "3000"
+      # `encode gzip` do Caddyfile.
+      traefik.http.middlewares.deskcomm-compress.compress: "true"
+      # `respond @waha_global 403` do Caddyfile: o webhook GLOBAL do WAHA não
+      # pode ser alcançável da internet (injeção de mensagem falsa no CRM).
+      # ipallowlist com TEST-NET-1 (RFC 5737): nenhum cliente real tem esse
+      # IP, então toda requisição àquele caminho recebe 403.
+      traefik.http.routers.deskcomm-waha-block.rule: "Host(`${DOMAIN}`) && Path(`/api/v1/webhooks/waha`)"
+      traefik.http.routers.deskcomm-waha-block.entrypoints: "${TRAEFIK_ENTRYPOINT:-websecure}"
+      traefik.http.routers.deskcomm-waha-block.tls.certresolver: "${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      traefik.http.routers.deskcomm-waha-block.priority: "1000"
+      traefik.http.routers.deskcomm-waha-block.service: "deskcomm"
+      traefik.http.routers.deskcomm-waha-block.middlewares: "deskcomm-deny"
+      traefik.http.middlewares.deskcomm-deny.ipallowlist.sourcerange: "192.0.2.1/32"
+      # HTTP -> HTTPS (o Caddy fazia isto sozinho; no Traefik precisa ser dito).
+      traefik.http.routers.deskcomm-http.rule: "Host(`${DOMAIN}`)"
+      traefik.http.routers.deskcomm-http.entrypoints: "${TRAEFIK_ENTRYPOINT_HTTP:-web}"
+      traefik.http.routers.deskcomm-http.middlewares: "deskcomm-https"
+      traefik.http.routers.deskcomm-http.service: "deskcomm"
+      traefik.http.middlewares.deskcomm-https.redirectscheme.scheme: "https"
+      traefik.http.middlewares.deskcomm-https.redirectscheme.permanent: "true"
+
+  # Worker 24/7 do agent-engine — cérebro do agente SDR.
+  worker:
+    mem_limit: 512m
+    image: ${WORKER_IMAGE:-ghcr.io/melgarafael/deskcomm-worker:stable}
+    pull_policy: ${WORKER_PULL_POLICY:-always}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # dentro da rede do compose, o WAHA é o serviço 'waha' na porta interna 3000
+      WAHA_API_BASE_URL: http://waha:3000
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  waha:
+    mem_limit: 1280m
+    # Tag PINADA: sem tag o `pull` entregaria qualquer versão nunca testada.
+    image: ${WAHA_IMAGE:-devlikeapro/waha:latest-2026.7.2}
+    restart: unless-stopped
+    environment:
+      # Prefixo sha512: faz o WAHA HASHEAR o X-Api-Key recebido e comparar com
+      # este hash. Sem o prefixo ele compara literal e o app toma 401.
+      WAHA_API_KEY: "sha512:${WAHA_API_KEY_SHA512}"
+      WHATSAPP_HOOK_URL: ${WAHA_WEBHOOK_BASE_URL}/api/v1/webhooks/waha
+      WHATSAPP_HOOK_EVENTS: "message.any,message.ack,message.edited,message.revoked,session.status,state.change"
+      WHATSAPP_HOOK_HMAC: ${WAHA_HMAC_SECRET}
+      # WHATSAPP_DEFAULT_ENGINE (NÃO WAHA_DEFAULT_ENGINE, que não existe e caía
+      # no default WEBJS, engine com browser que trava a sessão; NOWEB é
+      # websocket direto, estável e leve).
+      WHATSAPP_DEFAULT_ENGINE: ${WHATSAPP_DEFAULT_ENGINE:-NOWEB}
+      WAHA_DASHBOARD_ENABLED: "false"    # nunca expor o dashboard num deploy público
+      # True retoma as sessões já pareadas no restart — não reloga, não pede QR.
+      WHATSAPP_RESTART_ALL_SESSIONS: "${WHATSAPP_RESTART_ALL_SESSIONS:-True}"
+    volumes:
+      - waha-data:/app/.sessions          # sessões pareadas (QR) — perder = re-parear
+      - waha-media:/app/.media
+    logging: *default-logging
+    networks: [internal]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]  # efêmero (rate-limit/debounce)
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    logging: *default-logging
+    networks: [internal]
+
+  srh:
+    # serverless-redis-http: fala o REST do Upstash sobre o redis normal,
+    # mantendo o SDK @upstash/redis sem tocar código. Pinado por DIGEST.
+    image: hiett/serverless-redis-http@sha256:5b0bb9239fce53abf87b2018a7a0deb9ec7bd900c5360738fe5fbeeb426f9150
+    restart: unless-stopped
+    environment:
+      SRH_MODE: env
+      SRH_TOKEN: ${SRH_TOKEN}
+      SRH_CONNECTION_STRING: "redis://redis:6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging: *default-logging
+    networks: [internal]
+
+  scheduler:
+    # Cron sem docker.sock: crond interno batendo curl na rede interna.
+    image: ${SCHEDULER_IMAGE:-ghcr.io/melgarafael/deskcomm-scheduler:stable}
+    pull_policy: ${SCHEDULER_PULL_POLICY:-always}
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      TZ: UTC
+      INTERNAL_SECRET: ${INTERNAL_SECRET}
+    logging: *default-logging
+    networks: [internal]
+
+  # ── Chamada de voz WhatsApp — DESLIGADA POR PADRÃO ─────────────────────────
+  # `profiles:` = sem o profile ativo, o compose NEM CRIA o contêiner. Ligar é
+  # `COMPOSE_PROFILES=voz` no Environment. Nunca nomear o serviço no comando
+  # de deploy (isso ATIVA o profile sozinho) e nunca pôr `depends_on: wacalls`
+  # em app/worker (com o profile inativo o dependente NÃO SOBE).
+  wacalls:
+    profiles: ["voz"]
+    mem_limit: 256m
+    image: ${WACALLS_IMAGE:-ghcr.io/jotadev66/wacalls@sha256:9ff52ef9455cf42125a911c38bb8c855f0cc205516cada2054e5c05546909022}
+    pull_policy: ${WACALLS_PULL_POLICY:-missing}
+    restart: unless-stopped
+    environment:
+      WACALLS_ADMIN_USER: ${WACALLS_ADMIN_USER:-}
+      WACALLS_ADMIN_PASSWORD: ${WACALLS_ADMIN_PASSWORD:-}
+      WACALLS_API_TOKEN: ${WACALLS_API_TOKEN:-}
+      WACALLS_CORS_ORIGINS: ${WACALLS_CORS_ORIGINS:-}
+      WACALLS_TRUSTED_PROXIES: ${WACALLS_TRUSTED_PROXIES:-}
+      WACALLS_PUBLIC_IP: ${WACALLS_PUBLIC_IP:-}
+      WACALLS_WEBRTC_UDP_PORT: ${WACALLS_WEBRTC_UDP_PORT:-7881}
+    ports:
+      # A ÚNICA porta publicada além do proxy, e só UDP: o áudio do WebRTC não
+      # fala HTTP, então nenhum proxy o carrega. host == contêiner de
+      # PROPÓSITO (o número entra no candidato SDP). NUNCA TCP aqui: exporia a
+      # interface de administração do serviço à internet.
+      - "${WACALLS_WEBRTC_UDP_PORT:-7881}:${WACALLS_WEBRTC_UDP_PORT:-7881}/udp"
+    volumes:
+      - wacalls-data:/data
+    logging: *default-logging
+    networks: [internal]
+
+volumes:
+  waha-data:
+  waha-media:
+  wacalls-data:
+
+networks:
+  internal:
+    driver: bridge
+  # Rede do Traefik do Dokploy (externa, criada pela plataforma). O default
+  # `dokploy-network` é o nome padrão da instalação; se a sua usa outro,
+  # ajuste TRAEFIK_NETWORK no Environment.
+  proxy:
+    external: true
+    name: "${TRAEFIK_NETWORK:-dokploy-network}"

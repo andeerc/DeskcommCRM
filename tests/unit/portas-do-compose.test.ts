@@ -32,13 +32,13 @@ import { describe, expect, it } from "vitest";
  * controle decorativo já pagou); e uma label `traefik.enable` fora do `app`
  * publica pelo proxy da hospedagem, sem passar por porta nenhuma.
  *
- * ─── ESCOPO ──────────────────────────────────────────────────────────────────
- *
- * `docker-compose.prod.yml` e `docker-compose.traefik.yml` — os que rodam na
- * VPS do cliente. O `docker-compose.yml` (dev) está FORA de propósito: publicar
- * portas na máquina de quem desenvolve é justamente o que ele existe para
- * fazer.
- */
+ * `docker-compose.prod.yml`, `docker-compose.traefik.yml` e
+ * `docker-compose.dokploy.yml` — os que rodam na VPS do cliente. O
+ * `docker-compose.yml` (dev) está FORA de propósito: publicar portas na
+ * máquina de quem desenvolve é justamente o que ele existe para fazer. O
+ * manifesto do Dokploy não tem `caddy` (o proxy é o Traefik da plataforma),
+ * então a regra "só o proxy publica TCP" continua valendo por vacuidade:
+ * nenhum serviço dele publica TCP.
 
 const RAIZ = process.cwd();
 
@@ -122,19 +122,24 @@ function semComentarios(bloco: string): string {
     .join("\n");
 }
 
-const ARQUIVOS = ["docker-compose.prod.yml", "docker-compose.traefik.yml"] as const;
+const ARQUIVOS = ["docker-compose.prod.yml", "docker-compose.traefik.yml", "docker-compose.dokploy.yml"] as const;
 
 const SERVICOS = new Map<string, Map<string, string>>(
   ARQUIVOS.map((f) => [f, lerServicos(fs.readFileSync(path.join(RAIZ, f), "utf8"))]),
 );
 
 describe("a fronteira de rede do que o cliente instala", () => {
-  it("o parser enxerga os serviços dos dois compose", () => {
+  it("o parser enxerga os serviços dos três composes", () => {
     // GUARDA DO INSTRUMENTO. Sem esta asserção, um parser quebrado deixaria
     // todos os casos abaixo verdes por não terem medido nada — que é a forma
     // mais silenciosa de um gate morrer.
     expect([...SERVICOS.get("docker-compose.prod.yml")!.keys()].sort()).toEqual(
       ["app", "caddy", "redis", "scheduler", "srh", "wacalls", "waha", "worker"].sort(),
+    );
+    // O manifesto do Dokploy é autocontido (prod + override num arquivo só):
+    // os mesmos serviços de runtime, sem `caddy` (o proxy é o da plataforma).
+    expect([...SERVICOS.get("docker-compose.dokploy.yml")!.keys()].sort()).toEqual(
+      ["app", "redis", "scheduler", "srh", "wacalls", "waha", "worker"].sort(),
     );
     // O override do proxy externo declara um subconjunto (só o que ele muda).
     const traefik = [...SERVICOS.get("docker-compose.traefik.yml")!.keys()];
@@ -238,6 +243,38 @@ describe("a fronteira de rede do que o cliente instala", () => {
         `\`ports:\` não enxerga. Só o \`app\` tem superfície feita para o público.`,
     ).toEqual([]);
   });
+  it("o manifesto do Dokploy não usa container_name, build nem bind do repo", () => {
+    // Três proibições que só valem no Dokploy, cada uma com um motivo da plataforma:
+    // - `container_name:` quebra logs, métricas e recriação no painel.
+    // - `build:` amarra o deploy ao daemon do host e congela o runtime (é o
+    //   defeito do worker que o gate de packaging vigia no compose padrão).
+    // - bind `./arquivo` (ex. Caddyfile): o AutoDeploy re-clona o repo a cada
+    //   deploy e o mount sai vazio — por isso o manifesto não monta nenhum
+    //   arquivo do repo.
+    const bloco = SERVICOS.get("docker-compose.dokploy.yml")!;
+    const comNome = [...bloco.entries()].filter(([, b]) =>
+      /^\s{4}container_name:/m.test(semComentarios(b)),
+    );
+    expect(
+      comNome.map(([n]) => n),
+      `container_name no manifesto do Dokploy: ${comNome.map(([n]) => n).join(", ")}`,
+    ).toEqual([]);
+    const comBuild = [...bloco.entries()].filter(([, b]) =>
+      /^\s{4}build:/m.test(semComentarios(b)),
+    );
+    expect(
+      comBuild.map(([n]) => n),
+      `build: no manifesto do Dokploy: ${comBuild.map(([n]) => n).join(", ")}`,
+    ).toEqual([]);
+    const comBindRepo = [...bloco.entries()].filter(([, b]) =>
+      /^\s{6}-\s*\.?\//m.test(semComentarios(b)),
+    );
+    expect(
+      comBindRepo.map(([n]) => n),
+      `bind de arquivo do repo no manifesto do Dokploy: ${comBindRepo.map(([n]) => n).join(", ")}`,
+    ).toEqual([]);
+  });
+
 
   it("o serviço de chamada de voz nasce num profile desligado", () => {
     // Não é sobre porta, e é a razão de o serviço ser seguro por padrão: sem

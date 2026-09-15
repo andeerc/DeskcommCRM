@@ -15,10 +15,9 @@ build/
 .turbo/
 .vercel/
 
-# Env — ignora todo .env*, exceto os templates de exemplo
-.env*
 !.env.example
 !.env.hostgator.example
+!.env.dokploy.example
 
 # Testing & coverage
 coverage/

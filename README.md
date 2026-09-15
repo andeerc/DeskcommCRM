@@ -120,6 +120,62 @@ Caddy que não caberia. Num caso específico — proxy em `--network host`, como
 ele **pergunta em vez de adivinhar**, porque publicar atrás do proxy errado instala "com
 sucesso" um site mudo. Detalhes em [`hostgator-setup-kit/README.md`](hostgator-setup-kit/README.md#vps-que-já-vem-com-proxy-próprio-hostinger-coolify-dokploy).
 
+#### Deploy via Dokploy (Compose)
+
+Se você usa o Dokploy em vez de SSH, não precisa do `install.sh`. O manifesto
+`docker-compose.dokploy.yml` junta o compose de produção com o override do
+Traefik num arquivo só: sem Caddy, sem `container_name`, sem `build`, e o app
+publicado pelo Traefik da plataforma via labels. No Dokploy, crie um service
+Compose a partir do seu fork, aponte o compose path para
+`./docker-compose.dokploy.yml`, cole o `.env.dokploy.example` preenchido no
+Environment e faça o deploy.
+
+O Environment do Dokploy vira o `.env` ao lado do compose. O app e o worker o
+leem por `env_file`, então tudo abaixo entra nos contêineres sem editar YAML.
+
+Obrigatórias (sem elas o app não sobe ou não atende):
+
+| Variável | O que é |
+|---|---|
+| `DOMAIN` | Domínio público do CRM. Alimenta as regras `Host()` do Traefik. Exige A-record apontando para o VPS. |
+| `NEXT_PUBLIC_SUPABASE_URL` | URL do projeto Supabase. |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Chave anon (Supabase → Settings → API). |
+| `SUPABASE_SERVICE_ROLE_KEY` | Service role. Só server, nunca commitar. |
+| `SUPABASE_DB_URL` | Connection string (Supabase → Settings → Database). |
+| `NEXT_PUBLIC_APP_URL`, `NEXT_PUBLIC_ADMIN_URL` | URLs canônicas. Entram em runtime via `PublicEnvScript`, sem rebuild. Precisam bater com `DOMAIN`. |
+| `INTERNAL_SECRET` | Segredo dos endpoints `/api/v1/cron/*`. Gerar com `openssl rand -hex 32`. |
+| `CPF_ENCRYPTION_KEY`, `AI_CRED_AES_KEY`, `WAHA_BYO_ENCRYPTION_KEY` | Chaves de cifra. Gerar com `openssl rand -base64 32`. |
+| `WAHA_API_KEY`, `WAHA_API_KEY_SHA512` | Plaintext que o app usa e o hash SHA512 que o container WAHA recebe. Gerar o hash com `echo -n "<chave>" \| sha512sum`. |
+| `WAHA_HMAC_SECRET` | Assinatura dos webhooks entre WAHA e app. Gerar com `openssl rand -hex 32`. |
+| `SRH_TOKEN`, `UPSTASH_REDIS_REST_TOKEN` | Token do redis interno. Mesmo valor nos dois. Gerar com `openssl rand -hex 32`. |
+| `OWNER_EMAIL`, `OWNER_PASSWORD` | Lidos uma vez pelo script de bootstrap, depois do primeiro deploy. |
+
+Fixas (vêm certas no exemplo, não mexa):
+
+`WAHA_API_BASE_URL`, `WAHA_WEBHOOK_BASE_URL`, `UPSTASH_REDIS_REST_URL`,
+`NODE_ENV=production`, `AGENT_DISPATCH_CONSUMER=engine`,
+`INTERNAL_AGENT_RUN_STUB=false`.
+
+Opcionais (o CRM sobe sem elas):
+
+| Variável | Efeito de deixar vazia |
+|---|---|
+| `AI_GATEWAY_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | O agente não responde. Dá para cadastrar depois em IA › Credenciais. |
+| `RESEND_API_KEY`, `RESEND_FROM_EMAIL` | Convites mostram o link de aceite na tela. O remetente precisa ser de domínio verificado na sua conta Resend. |
+| `SENTRY_DSN` | Erros anonimizados vão para o Sentry da comunidade. `off` desliga. |
+| `NUVEMSHOP_ENABLED` e `NUVEMSHOP_*` | Só preencha se usa Nuvemshop. |
+| `COMPOSE_PROFILES=voz` e `WACALLS_*` | Chamada de voz, desligada por padrão. Ligar vincula um segundo aparelho ao número, com risco de bloqueio da conta. |
+| `APP_IMAGE`, `WORKER_IMAGE`, `SCHEDULER_IMAGE` | Default `:stable` (última release). Em produção, trave as três no número da versão. |
+
+O que não cabe no Environment:
+
+1. Banco: crie o projeto no Supabase, habilite as extensões `vector`, `citext` e `pg_trgm`, e aplique `supabase/baseline.sql` uma vez via psql antes do primeiro deploy.
+2. DNS: A-record do `DOMAIN` para o IP do VPS.
+3. Deploy no Dokploy e aguarde o app saudável (`/api/v1/health` responde `status: ok`).
+4. Dono: com `OWNER_EMAIL` e `OWNER_PASSWORD` no Environment, abra o terminal do service `worker` e rode `pnpm exec tsx scripts/bootstrap-owner.ts` uma vez.
+5. Entre com o admin, conecte o WhatsApp pelo QR do onboarding e cadastre a chave de IA pela tela se não pôs no env.
+6. Atualizar: troque as três `*_IMAGE` para a tag nova, aplique o apêndice de migrations no banco e faça redeploy.
+
 ### Primeiro acesso
 
 Abra `https://<seu-domínio>` (o cadeado leva ~1 min pra aparecer), entre com o admin, e tenha o
